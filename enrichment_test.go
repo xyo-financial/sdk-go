@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/xyo-financial/sdk-go/v2/openapi"
 )
 
 func newTestServerAndClient(t *testing.T, expectedMethod, expectedPath string, statusCode int, responsePayload interface{}) (*httptest.Server, Client) {
@@ -775,5 +779,254 @@ func TestMultiTenant_OptionsAndCRLFRejection(t *testing.T) {
 	_, err = client.GetEnrichmentStatusWithOptions(context.Background(), "job-123", &BulkEnrichmentOptions{APIUser: "user\ninjected: bad"})
 	if err == nil || !strings.Contains(err.Error(), "invalid CRLF") {
 		t.Errorf("expected CRLF error, got: %v", err)
+	}
+}
+
+func TestDistributedTracing_OptionsAndContext(t *testing.T) {
+	var capturedCorrelationID, capturedTraceparent string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedCorrelationID = r.Header.Get("X-Correlation-ID")
+		capturedTraceparent = r.Header.Get("traceparent")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"merchant":"Starbucks","description":"Coffee","categories":["Food"],"logo":"","location":"London","address":""}`))
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	client, err := NewClient(&ClientConfig{
+		APIKey:  "test-api-key",
+		BaseURL: ts.URL,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	t.Run("tracing via RequestOptions", func(t *testing.T) {
+		capturedCorrelationID, capturedTraceparent = "", ""
+		_, err := client.EnrichTransactionWithOptions(context.Background(), &EnrichmentRequest{
+			Content:     "Coffee",
+			CountryCode: "GB",
+		}, &RequestOptions{
+			CorrelationID: "cid-123-xyz",
+			Traceparent:   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedCorrelationID != "cid-123-xyz" {
+			t.Errorf("expected X-Correlation-ID 'cid-123-xyz', got %q", capturedCorrelationID)
+		}
+		if capturedTraceparent != "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" {
+			t.Errorf("expected traceparent '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01', got %q", capturedTraceparent)
+		}
+	})
+
+	t.Run("tracing via context helpers", func(t *testing.T) {
+		capturedCorrelationID, capturedTraceparent = "", ""
+		ctx := WithCorrelationID(context.Background(), "cid-ctx-456")
+		ctx = WithTraceparent(ctx, "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00")
+
+		_, err := client.EnrichTransaction(ctx, &EnrichmentRequest{
+			Content:     "Coffee",
+			CountryCode: "GB",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedCorrelationID != "cid-ctx-456" {
+			t.Errorf("expected X-Correlation-ID 'cid-ctx-456', got %q", capturedCorrelationID)
+		}
+		if capturedTraceparent != "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00" {
+			t.Errorf("expected traceparent '00-1234567890abcdef1234567890abcdef-1234567890abcdef-00', got %q", capturedTraceparent)
+		}
+	})
+
+	t.Run("CRLF injection protection in tracing headers", func(t *testing.T) {
+		_, err := client.EnrichTransactionWithOptions(context.Background(), &EnrichmentRequest{
+			Content:     "Coffee",
+			CountryCode: "GB",
+		}, &RequestOptions{
+			CorrelationID: "cid-123\r\nInjected-Header: bad",
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid CRLF") {
+			t.Errorf("expected CRLF error for CorrelationID, got %v", err)
+		}
+
+		_, err = client.EnrichTransactionWithOptions(context.Background(), &EnrichmentRequest{
+			Content:     "Coffee",
+			CountryCode: "GB",
+		}, &RequestOptions{
+			Traceparent: "tp-123\nInjected-Header: bad",
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid CRLF") {
+			t.Errorf("expected CRLF error for Traceparent, got %v", err)
+		}
+	})
+}
+
+func TestRateLimitErrorHandling(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.Header().Set("RateLimit-Limit", "100")
+		w.Header().Set("RateLimit-Remaining", "0")
+		w.Header().Set("RateLimit-Reset", "1690000000")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{
+			"errors": [{
+				"type": "https://api.xyo.financial/errors/rate-limit-exceeded",
+				"title": "Rate Limit Exceeded",
+				"status": 429,
+				"detail": "Quota exhausted. Try again later."
+			}]
+		}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	client, err := NewClient(&ClientConfig{
+		APIKey:  "test-api-key",
+		BaseURL: ts.URL,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	_, err = client.EnrichTransaction(context.Background(), &EnrichmentRequest{
+		Content:     "Coffee",
+		CountryCode: "GB",
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var apiErr *ErrorResponse
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected error to unwrap to *ErrorResponse, got: %v", err)
+	}
+
+	if apiErr.HTTPStatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected HTTP status 429, got %d", apiErr.HTTPStatusCode)
+	}
+	if apiErr.RetryAfter != 30 {
+		t.Errorf("expected RetryAfter 30, got %d", apiErr.RetryAfter)
+	}
+	if apiErr.RateLimitLimit != 100 {
+		t.Errorf("expected RateLimitLimit 100, got %d", apiErr.RateLimitLimit)
+	}
+	if apiErr.RateLimitRemaining != 0 {
+		t.Errorf("expected RateLimitRemaining 0, got %d", apiErr.RateLimitRemaining)
+	}
+	if apiErr.RateLimitReset != 1690000000 {
+		t.Errorf("expected RateLimitReset 1690000000, got %d", apiErr.RateLimitReset)
+	}
+}
+
+func TestEnrichTransactions_BatchBoundsValidation(t *testing.T) {
+	client, err := NewClient(&ClientConfig{
+		APIKey: "test-api-key",
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	t.Run("empty slice (0 items)", func(t *testing.T) {
+		_, err := client.EnrichTransactions(context.Background(), []*EnrichmentRequest{})
+		if err == nil {
+			t.Fatal("expected error for empty slice, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("expected empty error message, got %v", err)
+		}
+	})
+
+	t.Run("exceeds 50,000 items (50,001 items)", func(t *testing.T) {
+		reqs := make([]*EnrichmentRequest, 50001)
+		req := &EnrichmentRequest{Content: "Coffee", CountryCode: "GB"}
+		for i := range reqs {
+			reqs[i] = req
+		}
+
+		_, err := client.EnrichTransactions(context.Background(), reqs)
+		if err == nil {
+			t.Fatal("expected error for >50000 items, got nil")
+		}
+		if !strings.Contains(err.Error(), "exceeds maximum allowed length of 50,000 items") {
+			t.Errorf("expected exceeds maximum limit error, got %v", err)
+		}
+	})
+}
+
+func TestCredentialRedactionInDebugLogs(t *testing.T) {
+	var buf bytes.Buffer
+	logWriter := &buf
+	log.SetOutput(logWriter)
+	defer log.SetOutput(os.Stderr)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"merchant":"TestMerchant","description":"TestDesc","categories":["Test"],"logo":"","location":"","address":""}`))
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(&ClientConfig{
+		APIKey:  "super-secret-api-key-12345",
+		BaseURL: ts.URL,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	cli := c.(*client)
+	cli.apiClient.GetConfig().Debug = true
+
+	ctx := context.WithValue(context.Background(), openapi.ContextAccessToken, "super-secret-api-key-12345")
+	_, err = c.EnrichTransaction(ctx, &EnrichmentRequest{
+		Content:     "Test Content",
+		CountryCode: "US",
+	})
+	if err != nil {
+		t.Fatalf("EnrichTransaction failed: %v", err)
+	}
+
+	logOutput := buf.String()
+	if strings.Contains(logOutput, "super-secret-api-key-12345") {
+		t.Errorf("log output leaked plain-text credentials! Output: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] in debug log output, got: %s", logOutput)
+	}
+}
+
+func TestUntypedStringContextKeysIgnored(t *testing.T) {
+	ts, _ := newTestServerAndClient(t, http.MethodPost, "/v1/ai/finance/enrichment/transaction", http.StatusOK, map[string]interface{}{
+		"merchant":    "Test",
+		"description": "Test",
+	})
+	defer ts.Close()
+
+	type untypedKey string
+	ctx := context.WithValue(context.Background(), untypedKey("X-Correlation-ID"), "untyped-cid")
+	ctx = context.WithValue(ctx, untypedKey("traceparent"), "untyped-tp")
+
+	cid, err := extractCorrelationID(ctx, nil)
+	if err != nil {
+		t.Fatalf("extractCorrelationID error: %v", err)
+	}
+	if cid != "" {
+		t.Errorf("expected empty correlation ID from untyped string context key, got %q", cid)
+	}
+
+	tp, err := extractTraceparent(ctx, nil)
+	if err != nil {
+		t.Fatalf("extractTraceparent error: %v", err)
+	}
+	if tp != "" {
+		t.Errorf("expected empty traceparent from untyped string context key, got %q", tp)
 	}
 }

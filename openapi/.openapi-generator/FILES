@@ -1,11 +1,7 @@
 .gitignore
-.travis.yml
-README.md
-api/openapi.yaml
 api_enrichment.go
 client.go
 configuration.go
-git_push.sh
 model_api_error.go
 model_enrich_transaction_collection_response.go
 model_enrich_transactions_request_inner.go
